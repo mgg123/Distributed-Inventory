@@ -5,9 +5,9 @@
 | 项目 | 内容 |
 |------|------|
 | 系统名称 | 基于Redis分布式强一致库存扣减系统 |
-| 文档版本 | V1.0 |
-| 编写日期 | 2026-05-01 |
-| 文档状态 | 初稿 |
+| 文档版本 | V2.0 |
+| 编写日期 | 2026-05-02 |
+| 文档状态 | 更新（同步spec.md第六轮评审修复） |
 
 ## 1 引言
 
@@ -82,6 +82,9 @@ RedisBucketManager
 public LockOrderResult lockInventory(Long skuId, int lockQuantity, String idempotentKey) {
     LockInventoryOrder existing = lockOrderMapper.selectByIdempotentKey(idempotentKey);
     if (existing != null) {
+        if ("ARCHIVED".equals(existing.getStatus())) {
+            return LockOrderResult.fail("LOCK_ORDER_ALREADY_ARCHIVED");
+        }
         return LockOrderResult.success(existing.getId());
     }
 
@@ -91,11 +94,7 @@ public LockOrderResult lockInventory(Long skuId, int lockQuantity, String idempo
         return LockOrderResult.fail("LOCK_QUANTITY_EXCEEDED");
     }
 
-    int actualLockQuantity = Math.min(lockQuantity, available);
-    if (autoLockEnabled) {
-        actualLockQuantity = Math.min(actualLockQuantity,
-            (int)((available) * (1 - reserveRatio)));
-    }
+    int actualLockQuantity = Math.min(lockQuantity, (int)(available * (1 - reserveRatio)));
 
     String lockOrderId = IdGenerator.nextId();
 
@@ -456,13 +455,17 @@ private DeductResult deductViaDB(String orderId, Long skuId, int quantity) {
 -- KEYS[2] = total_remaining key
 -- ARGV[1] = deduct quantity
 local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+local total = tonumber(redis.call('GET', KEYS[2]) or '0')
 local quantity = tonumber(ARGV[1])
-if current >= quantity then
+if current >= quantity and total >= quantity then
     redis.call('DECRBY', KEYS[1], quantity)
-    redis.call('DECRBY', KEYS[2], quantity)
-    return 1
+    local remaining = redis.call('DECRBY', KEYS[2], quantity)
+    if tonumber(remaining) <= 0 then
+        return 2  -- success + 分桶耗尽，触发合并提交
+    end
+    return 1  -- success
 else
-    return 0
+    return 0  -- insufficient
 end
 ```
 
@@ -498,12 +501,18 @@ return 1
 #### INCR回补Lua脚本
 
 ```lua
--- KEYS[1] = bucket key
--- KEYS[2] = total_remaining key
+-- KEYS[1] = meta key (inventory:lock:{lockOrderId}:meta)
+-- KEYS[2] = bucket key (inventory:lock:{lockOrderId}:bucket:{n})
+-- KEYS[3] = total_remaining key
 -- ARGV[1] = refund quantity
-redis.call('INCRBY', KEYS[1], ARGV[1])
-redis.call('INCRBY', KEYS[2], ARGV[1])
-return 1
+local metaExists = redis.call('EXISTS', KEYS[1])
+if tonumber(metaExists) == 1 then
+    redis.call('INCRBY', KEYS[2], ARGV[1])
+    redis.call('INCRBY', KEYS[3], ARGV[1])
+    return 1  -- INCR回补成功
+else
+    return 0  -- meta已失效，跳过INCR
+end
 ```
 
 ## 6 合并提交模块详细设计
@@ -578,9 +587,12 @@ DetailAggregator
 │     SET sq = sq - #{net_deduction},                       │
 │         wq = wq + #{net_deduction},                       │
 │         lq = lq - #{currentLockQuantity}                  │
-│     WHERE id=#{skuId} AND sq >= #{net_deduction}          │
+│     WHERE id=#{skuId}                                     │
+│       AND sq >= #{net_deduction}                          │
+│       AND lq >= #{currentLockQuantity}                    │
 │     → lq减量更新，支持多lockOrder并存                      │
 │     → WHERE sq >= net_deduction 最终防线                  │
+│     → WHERE lq >= currentLockQuantity 防止lq变负          │
 │     → 影响行数为0则事务回滚 + 告警                         │
 │                                                           │
 │ 4e. UPDATE lock_inventory_order                           │
@@ -643,18 +655,23 @@ public MergeResult triggerMerge(String lockOrderId) {
 
             int updated = inventoryMapper.mergeCommit(skuId, netDeduction, currentLockQuantity);
             if (updated == 0) {
-                throw new MergeCommitFailedException("SQ_INSUFFICIENT");
+                throw new MergeCommitFailedException("SQ_OR_LQ_INSUFFICIENT");
             }
 
             lockOrderMapper.updateStatusToArchived(lockOrderId);
             return null;
         });
 
+        lock.unlock();
+        lock = null;
+
         redisBucketManager.cleanupBuckets(lockOrderId, bucketCount);
         lockOrderMapper.updateMergeCompleted(lockOrderId);
 
     } finally {
-        lock.unlock();
+        if (lock != null && lock.isHeldByCurrentThread()) {
+            lock.unlock();
+        }
     }
 
     return MergeResult.success();
@@ -783,15 +800,13 @@ MERGED ──付款确认──→ OCCUPIED ──退款──→ REFUNDED
 
 ```java
 private void handlePendingCancel(DeductionDetail detail) {
-    boolean metaValid = redisBucketManager.isBucketMetaValid(detail.getLockOrderId());
-    if (metaValid) {
-        String bucketKey = "inventory:lock:" + detail.getLockOrderId()
-            + ":bucket:" + detail.getBucketIndex();
-        String totalRemainingKey = "inventory:lock:" + detail.getLockOrderId()
-            + ":total_remaining";
-        redisBucketManager.executeIncrRefundLua(
-            bucketKey, totalRemainingKey, detail.getQuantity());
-    }
+    String metaKey = "inventory:lock:" + detail.getLockOrderId() + ":meta";
+    String bucketKey = "inventory:lock:" + detail.getLockOrderId()
+        + ":bucket:" + detail.getBucketIndex();
+    String totalRemainingKey = "inventory:lock:" + detail.getLockOrderId()
+        + ":total_remaining";
+    redisBucketManager.executeIncrRefundLua(
+        metaKey, bucketKey, totalRemainingKey, detail.getQuantity());
 }
 ```
 
@@ -870,6 +885,10 @@ Redis连续超时次数 ≥ failThreshold (默认5次)
         → emergencyUnlock(skuId)
         → 对所有ACTIVE lockOrder触发紧急合并提交
         → 或直接 UPDATE inventory SET lq = 0 WHERE id = #{skuId}
+        → SET lq=0后必须同步UPDATE lock_inventory_order SET status='ARCHIVED'
+           WHERE sku_id = #{skuId} AND status = 'ACTIVE'
+        → 设置紧急降级开关 inventory:emergency_degrade:{skuId} = true, TTL=30s
+        → 降级开关存在期间扣减请求跳过Redis路径，直接走DB降级
 ```
 
 ### 9.3 Redis健康检测
@@ -979,13 +998,14 @@ public class MetricsCollector {
 | 并发场景 | 控制策略 | 机制 |
 |----------|----------|------|
 | 同一SKU并发锁库存 | SQL行锁 | WHERE sq - lq >= lockQuantity |
-| 同一SKU并发扣减(Redis) | Lua原子操作 | 桶计数器原子DECR |
+| 同一SKU并发扣减(Redis) | Lua原子操作 | 桶计数器原子DECR + total_remaining检查 |
 | 同一SKU并发扣减(DB降级) | SQL行锁 | WHERE sq - lq >= quantity |
 | 同一lockOrder并发合并提交 | 分布式锁 | RLock key=merge:{lockOrderId} |
 | PENDING取消与合并提交竞态 | 行锁 + 先标记后计算 | UPDATE获取行锁阻止CANCEL |
 | 同一订单重复扣减 | 唯一索引 | uk_order_sku (order_id, sku_id) |
 | 同一幂等键重复锁库存 | 唯一索引 | uk_idempotent_key |
-| 多lockOrder并存合并 | lq减量更新 | lq = lq - #{currentLockQuantity} |
+| 多lockOrder并存合并 | lq减量更新 + 非负约束 | lq = lq - #{currentLockQuantity} WHERE lq >= #{currentLockQuantity} |
+| 二次合并触发 | Step 4a影响0行跳过 | 幂等保障，避免lq变负 |
 
 ### 12.2 PENDING取消与合并提交竞态处理
 

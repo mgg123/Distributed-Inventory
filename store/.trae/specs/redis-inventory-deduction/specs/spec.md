@@ -30,13 +30,14 @@
 - **查询链路无感知**：库存展示/查询完全不受锁库存影响，无需关心lq值
 - **Redis初始化**：每次锁定的lq数量必须同步初始化到Redis分桶中用于扣减计数
 - **锁周期闭环**：合并提交后lq减去当前lockOrder的lockQuantity，未卖出的库存自然保留在sq中，等待下一轮锁库存初始化
-- **多单据并行隔离**：分桶Key包含lockOrderId维度（`inventory:lock:{lockOrderId}:bucket:{n}`），同一SKU的不同lockOrder拥有各自独立的分桶，合并失效时仅影响当前lockOrder的分桶，不影响其他lockOrder的扣减能力
+- **多单据并行隔离**：分桶Key包含lockOrderId维度（`inventory:{lockOrderId}:lock:bucket:{n}`），同一SKU的不同lockOrder拥有各自独立的分桶，合并失效时仅影响当前lockOrder的分桶，不影响其他lockOrder的扣减能力
 - **部分锁定支持**：当可用额度 `sq - lq < lockQuantity` 但 `sq - lq > 0` 时，自动调整为实际可用额度作为锁定量，避免可用额度浪费
 - **预留DB降级额度**：手动锁库存同样应预留一定比例的可用额度给DB降级路径，接口增加可选参数 `reserveRatio`（默认值取 `store.auto-lock.reserve-ratio` 配置），计算公式与自动锁库存一致：`actualLockQuantity = min(lockQuantity, (sq - lq) * (1 - reserveRatio))`。调用方可显式传入 `reserveRatio=0` 锁定全部额度（适用于明确不需要DB降级路径的场景），但需在接口文档中标注风险。锁库存接口返回值包含 `actualLockQuantity` 和 `reservedQuantity`（预留额度 = (sq-lq) * reserveRatio），让调用方感知实际锁定量和预留量
+- **reserve-ratio与min-lock-quantity交互死区**：当 `min-lock-quantity / (1 - reserveRatio) > sq - lq >= min-lock-quantity` 时，存在"死区"——可用额度足够但锁库存失败（如reserve-ratio=0.1, min-lock-quantity=100时，100 <= sq-lq < 112 的范围约12件无法被Redis锁定）。死区大小约为 `min-lock-quantity * reserveRatio / (1 - reserveRatio)`，默认配置下约11件，影响极小。如需消除死区，可将min-lock-quantity降低或reserve-ratio设为0
 
 #### 并发控制策略
 - **SQL行锁防护**：InnoDB行锁保证并发UPDATE串行执行，`WHERE sq - lq >= #{lockQuantity}` 确保不会超锁
-- **应用层预校验**：锁库存前先查询 `sq - lq` 的值，若小于lockQuantity则尝试部分锁定（实际锁定量 = min(lockQuantity, sq - lq)），若可用额度低于最小有效锁定量（`store.auto-lock.min-lock-quantity`，默认100）则直接返回错误
+- **应用层预校验**：锁库存前先查询 `sq - lq` 的值，若小于lockQuantity则尝试部分锁定（实际锁定量 = min(lockQuantity, (sq - lq) * (1 - reserveRatio))，reserve-ratio始终生效，包括部分锁定场景），若计算结果低于最小有效锁定量（`store.auto-lock.min-lock-quantity`，默认100）则直接返回错误
 - **错误码定义**：锁库存失败时返回 `LOCK_QUANTITY_EXCEEDED`（可用额度不足）
 - **幂等保障**：锁库存请求携带 `idempotentKey`，在 `lock_inventory_order` 表的 `idempotent_key` 唯一索引约束下保证同一请求不会重复创建lockOrder
 
@@ -49,8 +50,9 @@
 > **幂等冲突时的Redis清理**：当Step 2的INSERT因idempotent_key唯一索引冲突失败时，使用当前请求预生成的lockOrderId执行Lua原子清理脚本回滚Step 1的Redis分桶（bucket keys、meta key、total_remaining key）。幂等检查应在Step 1之前执行（`SELECT id FROM lock_inventory_order WHERE idempotent_key = #{idempotentKey}`），如果已存在则直接返回已有lockOrderId，避免无谓的Redis初始化和清理。
 
 ```
-Step 0: 幂等检查: SELECT id FROM lock_inventory_order WHERE idempotent_key = #{idempotentKey}
-        → IF 已存在: 直接返回已有lockOrderId，不重复执行
+Step 0: 幂等检查: SELECT id, status FROM lock_inventory_order WHERE idempotent_key = #{idempotentKey}
+        → IF 已存在且status=ACTIVE: 直接返回已有lockOrderId，不重复执行
+        → IF 已存在且status=ARCHIVED: 返回错误码 `LOCK_ORDER_ALREADY_ARCHIVED`，提示调用方使用新的idempotentKey重新发起锁库存请求
 Step 1: Redis Lua脚本原子初始化分桶 + 分桶索引缓存(meta) + 总余量Key(total_remaining)
         → 使用预生成的lockOrderId构造Redis Key
         → 必须最先执行，确保Redis侧资源就绪
@@ -60,10 +62,11 @@ Step 2: DB事务内执行:
         b. INSERT lock_inventory_order（status=ACTIVE, lock_quantity=#{actualLockQuantity}, idempotent_key=#{idempotentKey}）
         → UPDATE和INSERT必须在同一DB事务中，保证原子性
         → 事务失败时（包括唯一索引冲突），使用Lua原子清理脚本回滚Step 1的Redis分桶（使用预生成的lockOrderId构造Key）
-Step 3: 原子更新路由缓存: SET inventory:active_lock:{skuId} = newLockOrderId
+Step 3: 原子更新路由缓存: 使用Lua脚本原子执行 SET inventory:active_lock:{skuId} = newLockOrderId + RPUSH inventory:active_lock_history:{skuId} = newLockOrderId
         → 必须在Step 1和Step 2全部完成后才能执行
         → 路由更新是锁库存操作的最后一步
         → 任何前置步骤失败，不更新路由缓存
+        → Step 3失败处理：对Lua脚本执行增加重试机制（最多3次，间隔100ms）。若重试仍失败，后台补偿任务定期扫描 lock_inventory_order WHERE status='ACTIVE' AND created_at < NOW() - INTERVAL 5 SECOND 的记录，检查其lockOrderId是否在路由缓存中，若不在则补偿更新路由缓存。应用启动时也应在崩溃恢复逻辑中检查并修复缺失的路由缓存
 ```
 
 > **预校验值与DB实际值不一致**：Step 1的Redis初始化数量基于预校验计算的actualLockQuantity，但Step 2的DB UPDATE受`WHERE sq - lq >= #{actualLockQuantity}`约束。如果预校验和UPDATE之间sq-lq发生变化（并发环境正常现象）：sq-lq减小→UPDATE影响行数为0→事务失败→Redis清理（正确处理）；sq-lq增大→UPDATE成功但锁定量少于新的可用额度→差额由后续自动锁库存补充（连锁触发机制保障）。
@@ -81,8 +84,8 @@ Step 3: 原子更新路由缓存: SET inventory:active_lock:{skuId} = newLockOrd
 
 - **WHEN** 业务方调用锁库存接口，传入锁定数量800
 - **AND** 当前 `sq - lq = 500`（可用额度不足但大于最小有效锁定量）
-- **THEN** 系统自动调整为部分锁定：actualLockQuantity = 500
-- **AND** Redis分桶初始化500件，DB lq增加500
+- **THEN** 系统自动调整为部分锁定：actualLockQuantity = min(800, 500 * (1 - reserveRatio)) = min(800, 450) = 450（reserve-ratio始终生效，包括部分锁定场景）
+- **AND** Redis分桶初始化450件，DB lq增加450，DB降级路径保留50件（500 * 0.1）
 
 #### Scenario: 锁库存失败（可用额度极低）
 
@@ -128,8 +131,8 @@ Step 3: 原子更新路由缓存: SET inventory:active_lock:{skuId} = newLockOrd
 
 自动锁库存的连锁触发采用以下混合模式：
 
-1. **扣减请求中同步快检**：在扣减请求路径中，读取当前活跃lockOrder的 `total_remaining` Key。如果低于阈值（`store.auto-lock.trigger-ratio`），发送异步事件触发自动锁库存。此检查不阻塞扣减请求主路径（异步发送，fire-and-forget）
-2. **后台定时任务兜底**：定时任务（间隔 `store.auto-lock.check-interval-ms`，默认500ms）扫描所有活跃lockOrder的 `total_remaining`，触发自动锁库存。作为同步快检的兜底，防止事件丢失
+1. **扣减请求中同步快检**：在扣减请求路径中，读取当前活跃lockOrder的 `total_remaining` Key。如果低于阈值（`store.auto-lock.trigger-ratio`），发送异步事件触发自动锁库存。此检查不阻塞扣减请求主路径（异步发送，fire-and-forget）。**事件去重**：发送事件前先SETNX `inventory:{skuId}:auto_lock_pending`（TTL=5s），已存在则跳过事件发送，避免高并发下多个扣减请求同时触发重复事件
+2. **后台定时任务兜底**：定时任务（间隔 `store.auto-lock.check-interval-ms`，默认500ms）扫描所有活跃lockOrder的 `total_remaining`，触发自动锁库存。作为同步快检的兜底，防止事件丢失。**活跃lockOrder列表获取**：优先从路由缓存获取（快速、低开销），定期（如每30秒）从DB查询全量ACTIVE lockOrder（`SELECT id, sku_id FROM lock_inventory_order WHERE status = 'ACTIVE'`）补充路由缓存中缺失的条目，并交叉验证一致性
 3. **不使用Redis Keyspace Notification**：在大规模Key场景下性能不可控，不采用
 
 > **fire-and-forget事件丢失的trade-off**：同步快检使用异步事件（fire-and-forget）保证扣减请求主路径零延迟，事件丢失由定时任务兜底。在10K TPS下，500ms兜底延迟意味着约5000个请求可能降级到DB路径。调优建议：高TPS场景下可将 `store.auto-lock.check-interval-ms` 缩短至100-200ms。异步事件使用Spring ApplicationEvent + 线程池，线程池配置建议：核心线程数=CPU核心数，队列容量=1000，拒绝策略=CallerRunsPolicy（降级为同步触发）。增加监控指标 `store.auto-lock.event.drop.count`（异步事件丢弃次数），当丢弃率过高时告警。
@@ -215,6 +218,21 @@ T=2.0s  Lock-B 合并提交开始
 
 #### 路由数据结构
 
+> **Redis Key设计规范（Redis Cluster兼容）**：所有Redis Key使用Hash Tag语法 `{...}` 确保同一实体的相关Key分布在同一hash slot，兼容Redis Cluster模式。Hash Tag内为实体标识（lockOrderId或skuId），决定Key的hash slot归属。以下为Key格式对照：
+>
+> | 逻辑Key | 实际Key格式 | Hash Tag | 说明 |
+> |---------|------------|----------|------|
+> | `inventory:lock:{lockOrderId}:bucket:{n}` | `inventory:{lockOrderId}:lock:bucket:{n}` | `{lockOrderId}` | 同一lockOrder的所有桶在同一slot |
+> | `inventory:lock:{lockOrderId}:meta` | `inventory:{lockOrderId}:lock:meta` | `{lockOrderId}` | 与桶Key同slot，Lua脚本需要 |
+> | `inventory:lock:{lockOrderId}:total_remaining` | `inventory:{lockOrderId}:lock:total_remaining` | `{lockOrderId}` | 与桶Key同slot，Lua脚本需要 |
+> | `inventory:lock:{lockOrderId}:deduct_qps:{window}` | `inventory:{lockOrderId}:lock:deduct_qps:{window}` | `{lockOrderId}` | 与桶Key同slot |
+> | `inventory:active_lock:{skuId}` | `inventory:{skuId}:active_lock` | `{skuId}` | 路由Key |
+> | `inventory:active_lock_history:{skuId}` | `inventory:{skuId}:active_lock_history` | `{skuId}` | 与路由Key同slot，Lua原子更新需要 |
+> | `inventory:auto_lock_pending:{skuId}` | `inventory:{skuId}:auto_lock_pending` | `{skuId}` | 与路由Key同slot |
+> | `inventory:emergency_degrade:{skuId}` | `inventory:{skuId}:emergency_degrade` | `{skuId}` | 与路由Key同slot |
+>
+> 文档中为可读性使用逻辑Key格式，实际实现必须使用Hash Tag格式。若部署为Redis Standalone/Sentinel模式，Hash Tag不影响正确性（仅作为Key前缀的一部分）。
+
 ```
 Redis Key: inventory:active_lock:{skuId}
 Value: lockOrderId（当前活跃的锁库存单据ID）
@@ -249,7 +267,8 @@ Value: List[lockOrderId]（最近N个活跃的lockOrderId，用于兜底查询�
 - **最大遍历数量**：限制历史路由遍历最多 `store.routing.max-history-scan`（默认3）个lockOrder，避免遍历过多增加延迟
 - **超时机制**：历史路由遍历总耗时不超过 `store.routing.history-scan-timeout-ms`（默认5ms），超时则直接降级DB
 - **余量预检**：遍历时先检查 `inventory:lock:{lockOrderId}:total_remaining` Key，余量为0或Key不存在的lockOrder直接跳过
-- **历史列表清理**：合并提交完成后，从 `inventory:active_lock_history:{skuId}` 中移除已ARCHIVED的lockOrderId，减少无效遍历
+- **历史列表清理**：合并提交完成后，从 `inventory:active_lock_history:{skuId}` 中移除已ARCHIVED的lockOrderId，减少无效遍历。**异步化优化**：历史列表清理改为异步——合并提交完成后发送异步事件，由后台任务清理历史列表。即使清理延迟，遍历时余量预检（检查total_remaining）也能跳过无效lockOrder，不影响正确性
+- **路由缓存主动清理**：合并提交完成后，若无新的ACTIVE lockOrder，主动删除 `inventory:active_lock:{skuId}` 路由缓存，避免后续扣减请求先查询到已ARCHIVED的lockOrder再降级，减少一次无效Redis GET操作（约0.5ms）。若有新的ACTIVE lockOrder，路由缓存已在创建新lockOrder时更新，无需额外操作
 
 #### 扣减接口变更
 
@@ -305,27 +324,37 @@ Value: List[lockOrderId]（最近N个活跃的lockOrderId，用于兜底查询�
 
 1. **WHEN** 用户发起下单请求
 2. **THEN** 系统从该lockOrder的N个分桶中随机选择一个，执行Lua脚本原子扣减
-3. **IF** Lua脚本返回成功（当前桶余量充足）
-4. **THEN** 继续往DB插入库存扣减明细记录
-5. **IF** Lua脚本返回当前桶余量不足，**THEN** fallover到其他桶重试（最多重试M次，默认3次）
+3. **IF** Lua脚本返回1（成功）或返回2（成功且分桶耗尽）
+4. **THEN** 继续往DB插入库存扣减明细记录；若返回2，同时异步触发该lockOrder的合并提交
+5. **IF** Lua脚本返回当前桶余量不足（返回0），**THEN** fallover到其他桶重试（最多重试M次，默认3次）
 6. **IF** 所有桶均不足或Redis超时/异常，**THEN** 降级走传统DB直接扣减流程
 
-#### Lua脚本扣减（防止DECR后计数器变负，同步更新total_remaining）
+#### Lua脚本扣减（防止DECR后计数器变负，同步更新total_remaining，分桶耗尽返回2触发合并）
 
 ```lua
 -- KEYS[1] = bucket key
 -- KEYS[2] = total_remaining key
 -- ARGV[1] = deduct quantity
 local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+local total = tonumber(redis.call('GET', KEYS[2]) or '0')
 local quantity = tonumber(ARGV[1])
-if current >= quantity then
+if current >= quantity and total >= quantity then
     redis.call('DECRBY', KEYS[1], quantity)
-    redis.call('DECRBY', KEYS[2], quantity)
+    local remaining = redis.call('DECRBY', KEYS[2], quantity)
+    if tonumber(remaining) <= 0 then
+        return 2  -- success + 分桶耗尽，触发合并提交
+    end
     return 1  -- success
 else
     return 0  -- insufficient
 end
 ```
+
+> **total_remaining防御性检查**：Lua脚本同时检查 `current >= quantity` 和 `total >= quantity`，防止因数据不一致导致total_remaining变负。正常情况下 `total >= current`，此检查为防御性编程。
+>
+> **返回值语义**：0=余量不足，1=扣减成功，2=扣减成功且分桶耗尽（应用层收到返回值2时异步触发该lockOrder的合并提交）。
+
+> **单桶扣减限制**：当前版本Lua扣减脚本要求单桶余量 >= 扣减数量（`current >= quantity`）。当quantity > 1且单桶余量不足但总余量充足时（如16桶各5件，购买10件），系统会降级走DB路径。**建议单桶初始容量 >= 常见最大购买数量**（如 `actualLockQuantity / N >= 10`）。中期可增强Lua脚本支持跨桶扣减。
 
 #### Lua脚本原子初始化分桶（防止部分桶初始化导致lq与Redis可用量不一致）
 
@@ -356,17 +385,25 @@ end
 return 1
 ```
 
-#### Lua脚本INCR回补（PENDING取消时回补桶计数和total_remaining）
+#### Lua脚本原子条件INCR回补（PENDING取消时回补桶计数和total_remaining）
 
 ```lua
--- KEYS[1] = bucket key
--- KEYS[2] = total_remaining key
+-- KEYS[1] = meta key (inventory:lock:{lockOrderId}:meta)
+-- KEYS[2] = bucket key (inventory:lock:{lockOrderId}:bucket:{n})
+-- KEYS[3] = total_remaining key
 -- ARGV[1] = refund quantity
--- 前置条件：分桶索引缓存(meta)仍然有效
-redis.call('INCRBY', KEYS[1], ARGV[1])
-redis.call('INCRBY', KEYS[2], ARGV[1])
-return 1
+-- 原子操作：检查meta有效性 + INCR回补在同一脚本内完成，避免meta检查与INCR执行之间的时间窗口
+local metaExists = redis.call('EXISTS', KEYS[1])
+if tonumber(metaExists) == 1 then
+    redis.call('INCRBY', KEYS[2], ARGV[1])
+    redis.call('INCRBY', KEYS[3], ARGV[1])
+    return 1  -- INCR回补成功
+else
+    return 0  -- meta已失效，跳过INCR
+end
 ```
+
+> **bucket_index有效性校验**：应用层构造Lua脚本KEYS前，必须校验bucket_index有效性（`0 <= bucketIndex < bucketCount`）。若bucket_index超出有效范围（因bug等），跳过INCR回补并记录告警，避免INCR作用于不存在的Key创建错误计数器。
 
 #### Scenario: 正常扣减流程（合并下单明细）
 
@@ -485,6 +522,8 @@ ARCHIVED（归档期）
 > 3. **子单据关联**：合并下单明细在MERGED/OCCUPIED状态下取消/退款时，通过lock\_order\_id关联锁库存单据追溯扣减上下文
 > 4. **对账审计**：锁库存单据记录了"这次锁库存操作最终卖出了多少、回收了多少"的完整快照
 > 5. **崩溃恢复**：`merge_completed` 标记用于检测合并提交后Redis分桶是否已清理完成，应用启动时扫描 `status='ARCHIVED' AND merge_completed=false` 的记录，补偿清理残留Redis分桶
+>
+> **ARCHIVED记录归档**：长期运行后 `lock_inventory_order` 表数据量持续增长，建议对 `status='ARCHIVED' AND merge_completed=true` 且所有子单据终态的记录定期归档到 `lock_inventory_order_archive` 表（或按 `created_at` 做按月分区，过期分区整体归档），超过保留期限（如90天）的ARCHIVED记录可安全删除
 
 ##### Scenario: 创建锁库存单据
 
@@ -561,22 +600,7 @@ MERGED(已合并) ──付款确认──▶ OCCUPIED(已占用) ──退款�
 
 > **关键差异1**：合并下单明细初始状态为 PENDING（Redis预扣减仅修改计数器，DB库存尚未变更），需经合并提交才进入 MERGED；普通下单明细初始状态直接为 MERGED（DB直接扣减时已同时完成 sq→wq 转移，无需合并步骤）。
 >
-> **关键差异2**：PENDING状态取消时，虽然DB库存无需操作，但**必须条件INCR回补Redis对应分桶计数**，否则该lockOrder下的分桶余量永久偏低，引发少卖。INCR回补前必须先检查分桶索引缓存（meta）是否仍然有效，若已失效（lockOrder正在合并提交或已完成合并）则跳过INCR（桶即将或已被清除，INCR无意义且可能产生竞态问题）。**条件INCR回补必须使用Lua脚本原子执行**（检查meta有效性 + INCR回补在同一脚本内完成），避免meta检查与INCR执行之间的时间窗口导致INCR作用于即将被清除的分桶。Lua脚本如下：
->
-> ```lua
-> -- KEYS[1] = meta key (inventory:lock:{lockOrderId}:meta)
-> -- KEYS[2] = bucket key (inventory:lock:{lockOrderId}:bucket:{n})
-> -- KEYS[3] = total_remaining key
-> -- ARGV[1] = refund quantity
-> local metaExists = redis.call('EXISTS', KEYS[1])
-> if tonumber(metaExists) == 1 then
->     redis.call('INCRBY', KEYS[2], ARGV[1])
->     redis.call('INCRBY', KEYS[3], ARGV[1])
->     return 1  -- INCR回补成功
-> else
->     return 0  -- meta已失效，跳过INCR
-> end
-> ```
+> **关键差异2**：PENDING状态取消时，虽然DB库存无需操作，但**必须条件INCR回补Redis对应分桶计数**，否则该lockOrder下的分桶余量永久偏低，引发少卖。INCR回补前必须先检查分桶索引缓存（meta）是否仍然有效，若已失效（lockOrder正在合并提交或已完成合并）则跳过INCR（桶即将或已被清除，INCR无意义且可能产生竞态问题）。**条件INCR回补必须使用Lua脚本原子执行**（检查meta有效性 + INCR回补在同一脚本内完成），避免meta检查与INCR执行之间的时间窗口导致INCR作用于即将被清除的分桶。Lua脚本定义见"Redis分桶扣减模块 → Lua脚本原子条件INCR回补"。
 >
 > MERGED及之后状态取消/退款时，Redis分桶已清除，回补操作仅在DB层面进行。
 
@@ -589,21 +613,22 @@ MERGED(已合并) ──付款确认──▶ OCCUPIED(已占用) ──退款�
 - **AND** 若明细插入失败（唯一索引冲突除外），需触发Redis回补机制（INCR恢复bucket\_index对应的分桶计数和total_remaining）
 
 > **幂等检查统一时序**：扣减请求统一为**先幂等检查后Lua扣减**（高效路径）——先SELECT检查(order_id, sku_id)是否已存在，已存在则直接返回（Lua未执行，无需INCR）；不存在则执行Lua扣减+DB INSERT。DB唯一索引作为最终幂等保障（防御路径）——INSERT冲突时INCR回补本次Lua扣减数量。
+>
+> **极致性能路径（可选优化）**：对于首次请求占绝大多数的场景，可省略前置SELECT，直接执行Lua扣减+DB INSERT，捕获DuplicateKeyException后INCR回补。省去首次请求的SELECT查询（约1ms DB延迟），10K TPS下每秒减少10000次SELECT。权衡：重试场景多执行一次Lua扣减+INCR回补（2次Redis操作 vs 1次DB SELECT），但重试是低频场景，总体收益为正。
 
 ##### Scenario: 插入普通下单明细（DB直接扣减路径）
 
 - **WHEN** Redis全部桶不足或Redis超时/异常，系统降级走DB直接扣减
 - **THEN** 系统在DB事务内原子执行：UPDATE inventory SET sq = sq - #{quantity}, wq = wq + #{quantity} WHERE id = #{skuId} AND sq - lq >= #{quantity}
 - **AND** 同时向deduction\_detail表插入一条扣减明细记录（扣减路径=DIRECT\_DB，状态=MERGED，lock\_order\_id=NULL）
+- **AND** 幂等检查在扣减请求入口统一执行（先于路由解析），DB降级路径同样受 `(order_id, sku_id)` 唯一索引保障
 - **AND** 若DB扣减失败（sq-lq可用额度不足），返回错误码 `INSUFFICIENT_STOCK`
 
 ##### Scenario: PENDING状态取消（合并提交前取消）
 
 - **WHEN** 合并下单明细处于PENDING状态时，用户取消订单
 - **THEN** 系统检查明细当前状态：
-  - **IF** 明细仍为PENDING：更新状态为CANCELLED，DB库存无需操作（sq/wq/lq均未变更），**原子条件INCR回补**：使用Lua脚本原子检查分桶索引缓存（`inventory:lock:{lockOrderId}:meta`）是否仍然有效，有效则INCR回补bucket\_index对应分桶计数和total\_remaining，已失效则跳过
-    - **IF** 分桶索引有效：执行INCR回补bucket\_index对应分桶计数和total\_remaining
-    - **IF** 分桶索引已失效：跳过INCR回补（lockOrder正在合并提交或已完成合并，桶即将或已被清除）
+  - **IF** 明细仍为PENDING：更新状态为CANCELLED，DB库存无需操作（sq/wq/lq均未变更），**原子条件INCR回补**：使用Lua脚本原子检查分桶索引缓存（`inventory:lock:{lockOrderId}:meta`）是否仍然有效，有效则INCR回补bucket\_index对应分桶计数和total\_remaining，已失效则跳过（Lua脚本内原子完成，无需额外操作）
   - **IF** 明细已被合并提交标记为MERGED（合并提交事务内"先标记后计算"获取了行锁，CANCEL操作被阻塞直到事务提交后）：走MERGED状态取消路径（wq回补sq），Redis无需操作（分桶已在合并提交时清除）
 - **AND** 此设计确保PENDING取消与合并提交的竞态安全：合并提交事务内UPDATE获取行锁阻止并发CANCEL，CANCEL操作要么在合并前完成（走PENDING取消路径），要么在合并后执行（走MERGED取消路径）
 
@@ -620,7 +645,7 @@ MERGED(已合并) ──付款确认──▶ OCCUPIED(已占用) ──退款�
 
 ##### 字段定义
 
-- 单据ID（全局唯一，主键，**天然作为退款幂等键**）
+- 单据ID（全局唯一，主键）
 - 商品ID/SKU
 - 回补数量（refund\_quantity）
 - 扣减路径（deduct\_path：同原明细，MERGE\_BUCKETS / DIRECT\_DB）
@@ -628,6 +653,12 @@ MERGED(已合并) ──付款确认──▶ OCCUPIED(已占用) ──退款�
 - 创建时间戳
 - 关联订单ID（order\_id）
 - 关联原扣减明细ID（ref\_detail\_id，外键关联deduction\_detail）
+- 退款请求标识（refund\_request\_id，**业务级幂等键**：由调用方（如支付系统）传入，同一退款请求的唯一标识，解决不同重试请求生成不同单据ID导致重复退款的问题。为NULL时退化为仅依赖主键幂等）
+
+##### 索引定义
+
+- PRIMARY KEY (id)
+- **UNIQUE KEY uk_ref_detail_request (ref\_detail\_id, refund\_request\_id)**：业务级退款幂等约束，同一扣减明细的同一退款请求只能有一条回补记录，防止支付系统回调重试（不同单据ID但同一退款请求）导致重复退款。**注意**：MySQL InnoDB中NULL值不参与唯一约束比较，即 `(ref_detail_id=1, refund_request_id=NULL)` 和 `(ref_detail_id=1, refund_request_id=NULL)` 可同时存在。因此当 `refund_request_id` 为NULL时，此唯一索引不提供去重保护，退化为仅依赖主键幂等。**建议调用方始终传入refund_request_id**以获得完整的业务级幂等保障
 
 ##### 为什么需要独立的回补明细模型？
 
@@ -677,8 +708,8 @@ MERGED(已合并) ──付款确认──▶ OCCUPIED(已占用) ──退款�
 
 #### 合并策略
 - **延迟触发**：热点下单延迟1秒后启动扫描（合并窗口期 `store.merge.delay-ms` 可配置，默认1000ms）
-- **分桶耗尽触发**：当某lockOrder的所有分桶余量为0时，立即触发合并提交（避免无谓等待）
-- **活跃度衰减触发**：当某lockOrder的扣减QPS低于阈值（`store.merge.idle-qps-threshold`，默认100/s）时，提前合并释放lq（适用于流量回落场景）
+- **分桶耗尽触发**：当某lockOrder的所有分桶余量为0时，立即触发合并提交（避免无谓等待）。检测机制：增强Lua扣减脚本，当total_remaining减至0时返回特殊标识（返回值2），应用层收到返回值2时异步触发该lockOrder的合并提交
+- **活跃度衰减触发**：当某lockOrder的扣减QPS低于阈值（`store.merge.idle-qps-threshold`，默认100/s）时，提前合并释放lq（适用于流量回落场景）。QPS测量采用**滑动窗口计数器**：每次扣减请求成功后INCR `inventory:lock:{lockOrderId}:deduct_qps:{second_window}`（Key含秒级时间窗口，TTL=2s自动过期），合并调度器每秒读取当前窗口的计数值，低于阈值则触发提前合并
 - **批量处理**：按锁库存单据维度聚合待合并明细，计算净扣减数量
 - **原子提交**：在事务内一次性完成DB库存字段更新和明细状态变更
 - **lq减量更新**：合并提交完成后将lq减去当前lockOrder的lockQuantity（而非重置为0），支持多lockOrder并存场景。未卖出的库存自然保留在sq中
@@ -698,26 +729,33 @@ MERGED(已合并) ──付款确认──▶ OCCUPIED(已占用) ──退款�
       WHERE lock_order_id = #{lockOrderId} AND status='PENDING' AND merge_batch_id IS NULL
       → 获取deduction_detail行锁，阻止并发CANCEL修改这些行的状态
       → 所有满足条件的PENDING明细（包括穿透窗口期间新插入的）被原子标记为MERGED
-   b. DB SELECT SUM(quantity) AS net_deduction
+   a.5. IF Step 4a影响行数为0:
+      → 无待合并明细（可能是重复触发），直接跳过Step 4b-4e，释放分布式锁，返回
+      → 这是幂等保障的关键：二次合并触发时Step 4a影响0行，若继续执行Step 4d的lq减量更新会导致lq变负（lq已在首次合并中减量）
+   b. DB SELECT COALESCE(SUM(quantity), 0) AS net_deduction
       FROM deduction_detail
       WHERE merge_batch_id = #{batchId}
       → 从Step 4a实际标记的明细计算净扣减值，与MERGED明细完全一致
       → 消除事务外预计算与事务内更新之间的时间窗口
+      → COALESCE防止Step 4a影响0行时SUM返回NULL
    c. DB SELECT lock_quantity AS currentLockQuantity
       FROM lock_inventory_order
       WHERE id = #{lockOrderId}
       → 获取当前lockOrder的锁定量，用于lq减量更新
    d. DB UPDATE inventory:
       SET sq = sq - #{net_deduction}, wq = wq + #{net_deduction}, lq = lq - #{currentLockQuantity}
-      WHERE id = #{skuId} AND sq >= #{net_deduction}
+      WHERE id = #{skuId} AND sq >= #{net_deduction} AND lq >= #{currentLockQuantity}
       → lq减量更新：减去当前lockOrder的lockQuantity，而非重置为0
       → WHERE sq >= #{net_deduction} 作为最终防线，防止sq变负
-      → 若UPDATE影响行数为0（sq不足），事务回滚，触发告警，进入人工处理流程
+      → WHERE lq >= #{currentLockQuantity} 防止lq变负（与sq/wq/oq非负约束一致）
+      → 若UPDATE影响行数为0（sq不足或lq不足），事务回滚，触发告警，进入人工处理流程
    e. DB UPDATE lock_inventory_order:
       SET status='ARCHIVED' WHERE id = #{lockOrderId}
+4.5 释放分布式锁   ← 提前释放：Step 5-6是幂等操作（重复DEL/UPDATE不影响正确性），无需持锁
 5. 清零/删除该lockOrder对应的Redis分桶（含bucket keys、meta key、total_remaining key）
+   → 幂等操作：重复DEL返回0，不影响正确性
 6. 更新 lock_inventory_order SET merge_completed = true WHERE id = #{lockOrderId}
-7. 释放分布式锁
+   → 幂等操作：重复UPDATE不影响正确性
 ```
 
 > **为什么采用"先标记后计算"而非"先扫描后更新"？**
@@ -786,13 +824,13 @@ MERGED(已合并) ──付款确认──▶ OCCUPIED(已占用) ──退款�
 - **GIVEN** 合并提交事务已提交完成，lockOrder状态已更新为ARCHIVED
 - **WHEN** 极端时序下，扣减请求在合并提交事务提交后、Redis桶清除前完成了Lua脚本和明细插入
 - **THEN** 产生一条PENDING明细，但其父lockOrder已ARCHIVED，该明细无法通过正常合并提交流转
-- **AND** 系统通过补偿扫描机制处理：定时任务查询 `SELECT * FROM deduction_detail WHERE status='PENDING' AND lock_order_id IN (SELECT id FROM lock_inventory_order WHERE status='ARCHIVED')`
+- **AND** 系统通过补偿扫描机制处理：定时任务查询 `SELECT d.* FROM deduction_detail d INNER JOIN lock_inventory_order l ON d.lock_order_id = l.id WHERE d.status = 'PENDING' AND l.status = 'ARCHIVED'`（JOIN优于IN子查询，大数据量下性能更优）
 - **AND** 对孤立PENDING明细执行补偿合并（按lockOrderId维度加分布式锁 `compensate:{lockOrderId}`，串行处理）：
   - 获取分布式锁（key=compensate:{lockOrderId}）
   - 事务内"先标记后计算"：
     - UPDATE deduction_detail SET status='MERGED', merge_batch_id = #{compensateBatchId}
       WHERE lock_order_id = #{lockOrderId} AND status='PENDING' AND merge_batch_id IS NULL
-    - SELECT SUM(quantity) AS net_deduction FROM deduction_detail WHERE merge_batch_id = #{compensateBatchId}
+    - SELECT COALESCE(SUM(quantity), 0) AS net_deduction FROM deduction_detail WHERE merge_batch_id = #{compensateBatchId}
     - UPDATE inventory SET sq = sq - #{net_deduction}, wq = wq + #{net_deduction}
       WHERE id = #{skuId} AND sq >= #{net_deduction}
       → 无需处理lq，lq已在原合并提交中减量更新
@@ -820,7 +858,7 @@ MERGED(已合并) ──付款确认──▶ OCCUPIED(已占用) ──退款�
 - **扣减屏障为性能优化**：合并提交时先失效分桶索引缓存（inventory:lock:{lockOrderId}:meta），减少穿透到事务内的请求数量，降低DB行锁竞争。屏障不是正确性的必要条件——即使屏障有少量穿透，事务内"先标记后计算"机制可保证净扣减值与实际MERGED明细一致，不会超卖
 - **事务内先标记后计算为正确性保障**：合并提交事务内先UPDATE标记PENDING→MERGED（获取行锁阻止并发CANCEL），再从已标记明细SELECT SUM计算净扣减值，确保计算与更新原子一致
 - **补偿机制完善**：针对各环节失败场景提供完整补偿
-- **lq减量更新为多lockOrder并存保障**：合并提交时 `lq = lq - #{currentLockQuantity}` 确保每个lockOrder只清除自己的lq份额，避免错误清除其他仍ACTIVE的lockOrder的lq
+- **lq减量更新为多lockOrder并存保障**：合并提交时 `lq = lq - #{currentLockQuantity}` 确保每个lockOrder只清除自己的lq份额，避免错误清除其他仍ACTIVE的lockOrder的lq（详见"合并提交模块 → 为什么lq减量更新而非重置为0？"）
 - **WHERE sq >= #{net_deduction} 为最终防线**：合并提交和补偿合并的SQL均增加此约束，防止sq变负
 
 #### 异常场景处理
@@ -849,15 +887,15 @@ MERGED(已合并) ──付款确认──▶ OCCUPIED(已占用) ──退款�
 
 当Redis不可用且 `sq - lq = 0`（全部库存锁定到Redis）时，DB降级路径也无法扣减，系统完全不可用。紧急降级方案如下：
 
-1. **紧急解锁接口**：提供 `emergencyUnlock(skuId)` 管理接口，对所有ACTIVE lockOrder逐个触发紧急合并提交（按lockOrderId维度加分布式锁串行处理），确保Redis分桶和lq同步释放。**禁止直接 `SET lq = 0`**：直接清零lq会移除DB降级路径对Redis预锁库存的保护屏障，若Redis部分恢复，Redis路径和DB降级路径可同时扣减同一批库存，导致超卖。如必须快速释放（合并提交耗时过长），应先使用Lua脚本批量清零所有ACTIVE lockOrder的Redis分桶，再SET lq=0，且在清零期间设置全局降级开关（`inventory:emergency_degrade:{skuId}` = true，TTL=30s），暂停Redis路径扣减，直到lq和Redis分桶同步处理完成
+1. **紧急解锁接口**：提供 `emergencyUnlock(skuId)` 管理接口，对所有ACTIVE lockOrder逐个触发紧急合并提交（按lockOrderId维度加分布式锁串行处理），确保Redis分桶和lq同步释放。**禁止直接 `SET lq = 0`**：直接清零lq会移除DB降级路径对Redis预锁库存的保护屏障，若Redis部分恢复，Redis路径和DB降级路径可同时扣减同一批库存，导致超卖。如必须快速释放（合并提交耗时过长），应先使用Lua脚本批量清零所有ACTIVE lockOrder的Redis分桶，再SET lq=0，且在清零期间设置全局降级开关（`inventory:emergency_degrade:{skuId}` = true，TTL=30s），暂停Redis路径扣减，直到lq和Redis分桶同步处理完成。**SET lq=0后必须同步更新所有ACTIVE lockOrder状态为ARCHIVED**（`UPDATE lock_inventory_order SET status='ARCHIVED' WHERE sku_id = #{skuId} AND status = 'ACTIVE'`），否则系统处于不一致状态（lq=0但lockOrder仍ACTIVE，后续自动锁库存检查sq-lq会误判可用额度）
 2. **预留DB降级额度**：自动锁库存时保留 `store.auto-lock.reserve-ratio`（默认0.1）的可用额度给DB降级路径，即 `actualLockQuantity = min(lockQuantity, (sq - lq) * (1 - reserve-ratio))`
-3. **Redis不可用自动检测**：当Redis连续超时次数超过 `store.redis.fail-threshold`（默认5次），自动触发紧急合并提交，释放所有ACTIVE lockOrder的lq
+3. **Redis不可用自动检测**：当Redis连续超时次数超过 `store.redis.fail-threshold`（默认5次），自动触发紧急合并提交，释放所有ACTIVE lockOrder的lq。超时计数采用**实例级共享**（`AtomicInteger redisFailCount`），任何线程遇到Redis超时即递增，成功即重置；当 `redisFailCount >= fail-threshold` 时，扫描所有有ACTIVE lockOrder的SKU，逐个触发紧急合并提交
 
 #### 约束层级定义
 
 - **SQL层硬约束**：`WHERE sq - lq >= #{lockQuantity}` 是最终防线，InnoDB行锁保证并发安全
 - **SQL层最终防线**：`WHERE sq >= #{net_deduction}` 防止合并提交/补偿合并导致sq变负
-- **SQL层字段非负防线**：`WHERE wq >= #{quantity}` / `WHERE oq >= #{quantity}` 防止取消/退款/付款确认导致wq/oq变负（MySQL默认不强制执行CHECK约束，需SQL层显式防护）
+- **SQL层字段非负防线**：`WHERE wq >= #{quantity}` / `WHERE oq >= #{quantity}` / `WHERE lq >= #{currentLockQuantity}` 防止取消/退款/付款确认/合并提交导致wq/oq/lq变负（MySQL默认不强制执行CHECK约束，需SQL层显式防护）
 - **应用层软校验**：锁库存前预查询 `sq - lq` 值，快速失败并返回明确错误码
 - **SQL层约束违反降级**：当UPDATE影响行数为0时，返回 `LOCK_QUANTITY_EXCEEDED` 错误码或触发告警
 
@@ -887,8 +925,9 @@ WHERE id = #{skuId} AND sq - lq >= #{quantity}
 -- SQL层硬约束（合并提交操作）
 -- lq减量更新：减去当前lockOrder的lockQuantity，而非重置为0
 -- WHERE sq >= #{net_deduction} 作为最终防线，防止sq变负
+-- WHERE lq >= #{currentLockQuantity} 防止lq变负（与sq/wq/oq非负约束一致）
 UPDATE inventory SET sq = sq - #{net_deduction}, wq = wq + #{net_deduction}, lq = lq - #{currentLockQuantity}
-WHERE id = #{skuId} AND sq >= #{net_deduction}
+WHERE id = #{skuId} AND sq >= #{net_deduction} AND lq >= #{currentLockQuantity}
 
 -- SQL层硬约束（补偿合并操作）
 -- 无需处理lq（lq已在原合并提交中减量更新）
@@ -943,6 +982,7 @@ CHECK (sq >= 0 AND wq >= 0 AND oq >= 0 AND lq >= 0)
 | store.compensate.merge.count      | Counter             | 补偿合并执行次数                   |
 | store.compensate.merge.fail.count | Counter             | 补偿合并失败次数（sq不足等）            |
 | store.emergency.unlock.count      | Counter             | 紧急解锁执行次数                   |
+| store.emergency.degrade.count     | Counter             | 紧急降级开关触发次数（扣减路径因emergency_degrade跳过Redis） |
 | store.merge.crash.recover.count   | Counter             | 启动时崩溃恢复补偿清理Redis分桶次数       |
 | store.auto-lock.event.drop.count  | Counter             | 自动锁库存异步事件丢弃次数（线程池满等）     |
 | store.cancel.refund.wq.insufficient.count | Counter    | 取消/退款时wq不足告警次数            |
@@ -1054,8 +1094,9 @@ CHECK (sq >= 0 AND wq >= 0 AND oq >= 0 AND lq >= 0)
    → 连锁触发：扣减请求中同步快检total_remaining + 后台定时任务兜底
 
 1. [预热阶段] LockService.lockInventory(skuId, lockQuantity, idempotentKey)
-   → 幂等检查：SELECT id FROM lock_inventory_order WHERE idempotent_key = #{idempotentKey}
-     → IF 已存在: 直接返回已有lockOrderId，不重复执行
+   → 幂等检查：SELECT id, status FROM lock_inventory_order WHERE idempotent_key = #{idempotentKey}
+     → IF 已存在且status=ACTIVE: 直接返回已有lockOrderId，不重复执行
+     → IF 已存在且status=ARCHIVED: 返回错误码 LOCK_ORDER_ALREADY_ARCHIVED
    → 预生成lockOrderId（雪花算法），用于构造Redis Key
    → Step 1 - Redis: 使用Lua脚本原子初始化N个per-lockOrder分桶（inventory:lock:{lockOrderId}:bucket:0..N-1）
             每个分桶设置 count = actualLockQuantity / N
@@ -1065,8 +1106,8 @@ CHECK (sq >= 0 AND wq >= 0 AND oq >= 0 AND lq >= 0)
    → Step 2 - DB事务内:
      a. UPDATE inventory SET lq = lq + #{actualLockQuantity}
         WHERE id = #{skuId} AND sq - lq >= #{actualLockQuantity}
-        → actualLockQuantity = min(lockQuantity, (sq - lq) * (1 - reserve-ratio))
-        → 部分锁定：当 sq - lq < lockQuantity 但 >= min-lock-quantity 时，actualLockQuantity = sq - lq
+        → actualLockQuantity = min(lockQuantity, (sq - lq) * (1 - reserve-ratio))（reserve-ratio始终生效，包括部分锁定场景）
+        → 当计算结果 < min-lock-quantity 时返回错误码 LOCK_QUANTITY_EXCEEDED
      b. INSERT lock_inventory_order（status=ACTIVE，lock_quantity=#{actualLockQuantity},
         idempotent_key=#{idempotentKey}, merge_completed=false）→ 父单据
      → IF DB事务失败: 回滚DB + Lua脚本原子清理Redis分桶
@@ -1083,6 +1124,9 @@ CHECK (sq >= 0 AND wq >= 0 AND oq >= 0 AND lq >= 0)
          查询DB: SELECT id FROM lock_inventory_order WHERE sku_id=#{skuId} AND status='ACTIVE' LIMIT 1
          IF 找到: 重建路由缓存
          IF 未找到: 降级走DB直接扣减路径（同下方路径B）
+   → 【紧急降级开关检查】查询 inventory:emergency_degrade:{skuId}
+     → IF 存在且值为true: 跳过Redis路径，直接走DB降级扣减（同下方路径B）
+     → 紧急降级期间Redis分桶正在被批量清零，若此时走Redis路径可能扣减到即将被清除的分桶，导致数据不一致
    → 【扣减屏障检查】查询该lockOrder的分桶索引缓存（inventory:lock:{lockOrderId}:meta）是否存在且有效
      → IF 分桶索引不存在或已标记失效（该lockOrder正在合并提交或已完成合并）:
          → 查询历史路由 inventory:active_lock_history:{skuId}，按创建时间倒序遍历
@@ -1093,10 +1137,11 @@ CHECK (sq >= 0 AND wq >= 0 AND oq >= 0 AND lq >= 0)
    → 随机选择一个桶，执行Lua脚本原子扣减
 
    【路径A：合并下单明细】Redis分桶预扣减路径
-   → IF Lua返回1（成功）:
+   → IF Lua返回1（成功）或返回2（成功且分桶耗尽）:
        DB: INSERT deduction_detail（deduct_path=MERGE_BUCKETS,
            status='PENDING', lock_order_id=当前锁库存单据ID,
            bucket_index=实际扣减的桶编号, order_id, sku_id）→ 子单据
+       IF Lua返回2: 异步触发该lockOrder的合并提交
        RETURN success
    → IF Lua返回0（当前桶不足）:
        fallover到其他桶重试（最多M次）
@@ -1120,18 +1165,20 @@ CHECK (sq >= 0 AND wq >= 0 AND oq >= 0 AND lq >= 0)
        UPDATE deduction_detail SET status='MERGED', merge_batch_id = #{batchId}
            WHERE lock_order_id = #{lockOrderId} AND status='PENDING' AND merge_batch_id IS NULL
            → 获取行锁，阻止并发CANCEL；原子标记所有PENDING为MERGED
-       SELECT SUM(quantity) AS net_deduction FROM deduction_detail WHERE merge_batch_id = #{batchId}
+       IF 影响行数为0: 释放分布式锁，返回（幂等：二次合并无待合并明细）
+       SELECT COALESCE(SUM(quantity), 0) AS net_deduction FROM deduction_detail WHERE merge_batch_id = #{batchId}
            → 从实际标记的明细计算净扣减值，与MERGED明细完全一致
        SELECT lock_quantity AS currentLockQuantity FROM lock_inventory_order WHERE id = #{lockOrderId}
            → 获取当前lockOrder的锁定量，用于lq减量更新
        UPDATE inventory SET sq = sq - #{net_deduction}, wq = wq + #{net_deduction}, lq = lq - #{currentLockQuantity}
-           WHERE id = #{skuId} AND sq >= #{net_deduction}
+           WHERE id = #{skuId} AND sq >= #{net_deduction} AND lq >= #{currentLockQuantity}
            → lq减量更新，支持多lockOrder并存
            → WHERE sq >= #{net_deduction} 最终防线
+           → WHERE lq >= #{currentLockQuantity} 防止lq变负
        UPDATE lock_inventory_order SET status='ARCHIVED' WHERE id = #{lockOrderId}
+   → 释放分布式锁（提前释放：后续Step 5-6是幂等操作，重复DEL/UPDATE不影响正确性）
    → 清零/删除该lockOrder的Redis分桶（bucket keys、meta key、total_remaining key）
    → UPDATE lock_inventory_order SET merge_completed = true WHERE id = #{lockOrderId}
-   → 释放分布式锁
 
 4. [回收阶段] LockExpireCleaner.checkExpired() [定时扫描]
    → 扫描超过过期时间的锁库存单据（lock_inventory_order WHERE status='ACTIVE' AND expire_time < NOW()）
@@ -1155,13 +1202,12 @@ CHECK (sq >= 0 AND wq >= 0 AND oq >= 0 AND lq >= 0)
        → IF UPDATE影响行数为0: 触发告警，进入人工处理流程
 
 6. [补偿阶段] CompensateService.compensateOrphanDetails() [定时扫描]
-   → 扫描孤立PENDING明细: SELECT * FROM deduction_detail WHERE status='PENDING'
-     AND lock_order_id IN (SELECT id FROM lock_inventory_order WHERE status='ARCHIVED')
+   → 扫描孤立PENDING明细: SELECT d.* FROM deduction_detail d INNER JOIN lock_inventory_order l ON d.lock_order_id = l.id WHERE d.status = 'PENDING' AND l.status = 'ARCHIVED'
    → 按lockOrderId维度获取分布式锁（compensate:{lockOrderId}）
    → 事务内"先标记后计算":
        UPDATE deduction_detail SET status='MERGED', merge_batch_id = #{compensateBatchId}
          WHERE lock_order_id = #{lockOrderId} AND status='PENDING' AND merge_batch_id IS NULL
-       SELECT SUM(quantity) AS net_deduction FROM deduction_detail WHERE merge_batch_id = #{compensateBatchId}
+       SELECT COALESCE(SUM(quantity), 0) AS net_deduction FROM deduction_detail WHERE merge_batch_id = #{compensateBatchId}
        UPDATE inventory SET sq = sq - #{net_deduction}, wq = wq + #{net_deduction}
          WHERE id = #{skuId} AND sq >= #{net_deduction}
    → 释放分布式锁
@@ -1170,13 +1216,13 @@ CHECK (sq >= 0 AND wq >= 0 AND oq >= 0 AND lq >= 0)
    → 扫描未完成的合并提交: SELECT * FROM lock_inventory_order
      WHERE status='ARCHIVED' AND merge_completed = false
    → 对每条记录补偿清理对应的Redis分桶（bucket keys、meta key、total_remaining key）
+     → 优化：先EXISTS检查Key是否存在，不存在则跳过DEL（避免无效操作），直接更新merge_completed
    → UPDATE lock_inventory_order SET merge_completed = true WHERE id = #{lockOrderId}
 
 8. [紧急降级阶段] EmergencyService.emergencyUnlock(skuId) [管理接口]
    → 当Redis不可用且sq-lq=0时，人工触发紧急解锁
-   → 对所有ACTIVE lockOrder触发紧急合并提交
-   → 或直接 UPDATE inventory SET lq = 0 WHERE id = #{skuId}
-   → 释放lq使DB降级路径可用
+   → 对所有ACTIVE lockOrder逐个触发紧急合并提交（按lockOrderId维度加分布式锁串行处理）
+   → 确保Redis分桶和lq同步释放，使DB降级路径可用
 ```
 
 ### 技术栈选型（已确认）

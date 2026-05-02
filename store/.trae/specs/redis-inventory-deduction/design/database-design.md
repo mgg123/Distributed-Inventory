@@ -5,9 +5,9 @@
 | 项目 | 内容 |
 |------|------|
 | 系统名称 | 基于Redis分布式强一致库存扣减系统 |
-| 文档版本 | V1.0 |
-| 编写日期 | 2026-05-01 |
-| 文档状态 | 初稿 |
+| 文档版本 | V2.0 |
+| 编写日期 | 2026-05-02 |
+| 文档状态 | 更新（同步spec.md第六轮评审修复） |
 
 ## 1 引言
 
@@ -34,6 +34,7 @@
 | 客户端 | Redisson |
 | 序列化 | JSON (分桶索引元数据) |
 | Key命名规范 | inventory:{功能域}:{标识} |
+| Hash Tag规范 | 同一实体的Key使用 `{实体ID}` 确保在同一hash slot，兼容Redis Cluster |
 
 ## 2 ER关系图
 
@@ -144,7 +145,7 @@ WHERE id = #{skuId} AND sq - lq >= #{quantity};
 -- 合并提交：sq减少，wq增加，lq减量更新
 UPDATE inventory
 SET sq = sq - #{netDeduction}, wq = wq + #{netDeduction}, lq = lq - #{currentLockQuantity}
-WHERE id = #{skuId} AND sq >= #{netDeduction};
+WHERE id = #{skuId} AND sq >= #{netDeduction} AND lq >= #{currentLockQuantity};
 
 -- 补偿合并：sq减少，wq增加
 UPDATE inventory SET sq = sq - #{netDeduction}, wq = wq + #{netDeduction}
@@ -351,15 +352,17 @@ MERGED ──付款确认──→ OCCUPIED ──退款──→ REFUNDED
 
 ```sql
 CREATE TABLE `refund_detail` (
-    `id`              VARCHAR(64)  NOT NULL COMMENT '单据ID，全局唯一，主键，天然作为退款幂等键',
-    `sku_id`          BIGINT       NOT NULL COMMENT '商品ID/SKU',
-    `refund_quantity` INT          NOT NULL COMMENT '回补数量',
-    `deduct_path`     VARCHAR(16)  NOT NULL COMMENT '扣减路径: 同原明细 MERGE_BUCKETS/DIRECT_DB',
-    `status`          VARCHAR(16)  NOT NULL DEFAULT 'MERGED' COMMENT '状态: MERGED，创建即生效',
-    `order_id`        VARCHAR(64)  NOT NULL COMMENT '关联订单ID',
-    `ref_detail_id`   VARCHAR(64)  NOT NULL COMMENT '关联原扣减明细ID',
-    `create_time`     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    `id`                  VARCHAR(64)  NOT NULL COMMENT '单据ID，全局唯一，主键',
+    `sku_id`              BIGINT       NOT NULL COMMENT '商品ID/SKU',
+    `refund_quantity`     INT          NOT NULL COMMENT '回补数量',
+    `deduct_path`         VARCHAR(16)  NOT NULL COMMENT '扣减路径: 同原明细 MERGE_BUCKETS/DIRECT_DB',
+    `status`              VARCHAR(16)  NOT NULL DEFAULT 'MERGED' COMMENT '状态: MERGED，创建即生效',
+    `order_id`            VARCHAR(64)  NOT NULL COMMENT '关联订单ID',
+    `ref_detail_id`       VARCHAR(64)  NOT NULL COMMENT '关联原扣减明细ID',
+    `refund_request_id`   VARCHAR(128) DEFAULT NULL COMMENT '退款请求标识，业务级幂等键，由调用方传入',
+    `create_time`         DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_ref_detail_request` (`ref_detail_id`, `refund_request_id`),
     INDEX `idx_ref_detail` (`ref_detail_id`),
     INDEX `idx_order` (`order_id`),
     INDEX `idx_sku` (`sku_id`)
@@ -370,20 +373,22 @@ CREATE TABLE `refund_detail` (
 
 | 字段 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
-| id | VARCHAR(64) | 是 | - | 单据ID，雪花算法生成，天然作为退款幂等键 |
+| id | VARCHAR(64) | 是 | - | 单据ID，雪花算法生成 |
 | sku_id | BIGINT | 是 | - | 商品ID/SKU |
 | refund_quantity | INT | 是 | - | 回补数量，支持部分退款 |
 | deduct_path | VARCHAR(16) | 是 | - | 扣减路径，同原明细 |
 | status | VARCHAR(16) | 是 | MERGED | 状态，创建即生效 |
 | order_id | VARCHAR(64) | 是 | - | 关联订单ID |
 | ref_detail_id | VARCHAR(64) | 是 | - | 关联原扣减明细ID，外键关联deduction_detail |
+| refund_request_id | VARCHAR(128) | 否 | NULL | 退款请求标识，业务级幂等键。由调用方（如支付系统）传入，同一退款请求的唯一标识。为NULL时退化为仅依赖主键幂等。**注意**：MySQL InnoDB中NULL值不参与唯一约束比较，建议调用方始终传入 |
 | create_time | DATETIME | 是 | CURRENT_TIMESTAMP | 创建时间 |
 
 #### 索引说明
 
 | 索引名 | 类型 | 字段 | 说明 |
 |--------|------|------|------|
-| PRIMARY | 主键 | id | 主键索引，天然幂等 |
+| PRIMARY | 主键 | id | 主键索引 |
+| uk_ref_detail_request | 唯一索引 | ref_detail_id, refund_request_id | 业务级退款幂等约束，同一扣减明细的同一退款请求只能有一条回补记录。refund_request_id为NULL时不参与唯一约束比较 |
 | idx_ref_detail | 普通索引 | ref_detail_id | 按原扣减明细查询回补记录 |
 | idx_order | 普通索引 | order_id | 按订单查询回补记录 |
 | idx_sku | 普通索引 | sku_id | 按SKU查询回补记录 |
@@ -507,10 +512,11 @@ Value:  List[lockOrderId]，最近N个活跃的lockOrderId
 |------|---------|----------|
 | 锁库存不超锁 | WHERE sq - lq >= lockQuantity | 防止lq超过sq |
 | DB降级不超卖 | WHERE sq - lq >= quantity | 防止DB降级侵占lq锁定库存 |
-| 合并提交不超卖 | WHERE sq >= net_deduction | 最终防线，防止sq变负 |
+| 合并提交不超卖 | WHERE sq >= #{net_deduction} AND lq >= #{currentLockQuantity} | 最终防线，防止sq/lq变负 |
 | 库存字段非负 | CHECK (sq>=0 AND wq>=0 AND oq>=0 AND lq>=0) | 防止任何库存字段变负 |
 | 扣减幂等 | UNIQUE (order_id, sku_id) | 防止同一订单重复扣减 |
 | 锁库存幂等 | UNIQUE (idempotent_key) | 防止重复锁库存 |
+| 退款业务幂等 | UNIQUE (ref_detail_id, refund_request_id) | 防止同一扣减明细同一退款请求重复退款 |
 
 ### 5.3 lq字段与lock_inventory_order的一致性
 

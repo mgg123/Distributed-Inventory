@@ -1,4 +1,6 @@
-# 项目目录层级结构设计计划
+# 项目目录层级结构设计
+
+> 版本 V2.0 — 同步spec.md第六轮评审修复（2026-05-02）
 
 ## 目标
 
@@ -124,7 +126,8 @@ com.mgg.exp.store
 │   │   ├── gateway                              # 网关接口(仅定义)
 │   │   │   ├── RedisBucketGateway.java          # Redis分桶网关
 │   │   │   ├── ActiveLockRouterGateway.java     # 活跃路由网关
-│   │   │   └── DistributedLockGateway.java      # 分布式锁网关
+│   │   │   ├── DistributedLockGateway.java      # 分布式锁网关
+│   │   │   └── EmergencyDegradeGateway.java     # 紧急降级开关网关
 │   │   └── event                                # 领域事件
 │   │       └── AutoLockEvent.java               # 自动锁库存事件
 │   │
@@ -155,6 +158,7 @@ com.mgg.exp.store
 │   │   │   └── RefundDetail.java                # 回补明细实体
 │   │   ├── valueobject                          # 值对象
 │   │   │   ├── RefundId.java                    # 回补明细ID
+│   │   │   ├── RefundRequestId.java            # 退款请求标识(业务级幂等键)
 │   │   │   └── RefundQuantity.java              # 回补数量
 │   │   ├── service                              # 领域服务
 │   │   │   └── RefundDomainService.java         # 回补领域服务(取消/退款)
@@ -177,7 +181,8 @@ com.mgg.exp.store
 │   ├── gateway                                  # 网关实现
 │   │   ├── RedisBucketGatewayImpl.java          # Redis分桶网关实现(Lua脚本执行)
 │   │   ├── ActiveLockRouterGatewayImpl.java     # 活跃路由网关实现(Redis路由缓存)
-│   │   └── DistributedLockGatewayImpl.java      # 分布式锁网关实现(Redisson RLock)
+│   │   ├── DistributedLockGatewayImpl.java      # 分布式锁网关实现(Redisson RLock)
+│   │   └── EmergencyDegradeGatewayImpl.java     # 紧急降级开关网关实现(Redis SETNX)
 │   ├── converter                                # 持久化对象转换器(PO ↔ Domain)
 │   │   ├── InventoryConverter.java
 │   │   ├── LockOrderConverter.java
@@ -298,12 +303,12 @@ Controller 入参(Request DTO)
 | App | service | 6 + 6(impl) |
 | App | assembler | 1 |
 | App | task | 4 |
-| Domain | inventory | 6(vo) + 1(aggregate) + 1(entity) + 1(service) + 2(repo) + 3(gateway) + 1(event) = 15 |
+| Domain | inventory | 6(vo) + 1(aggregate) + 1(entity) + 1(service) + 2(repo) + 4(gateway) + 1(event) = 16 |
 | Domain | deduction | 7(vo) + 1(aggregate) + 1(entity) + 1(service) + 1(repo) + 2(event) = 13 |
-| Domain | refund | 2(vo) + 1(entity) + 1(service) + 1(repo) = 5 |
+| Domain | refund | 3(vo) + 1(entity) + 1(service) + 1(repo) = 6 |
 | Domain | routing | 2(vo) + 1(service) = 3 |
 | Infrastructure | repository | 4 |
-| Infrastructure | gateway | 3 |
+| Infrastructure | gateway | 4 |
 | Infrastructure | converter | 4 |
 | Infrastructure | dataobject | 4 |
 | Infrastructure | mapper | 4 |
@@ -314,4 +319,4 @@ Controller 入参(Request DTO)
 | Common | exception | 5 |
 | Common | result | 1 |
 | Common | util | 1 |
-| **合计** | | **~95个Java文件 + 4个Lua脚本 + 1个SQL脚本** |
+| **合计** | | **~97个Java文件 + 4个Lua脚本 + 1个SQL脚本** |

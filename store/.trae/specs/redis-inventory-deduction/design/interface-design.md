@@ -5,9 +5,9 @@
 | 项目 | 内容 |
 |------|------|
 | 系统名称 | 基于Redis分布式强一致库存扣减系统 |
-| 文档版本 | V1.0 |
-| 编写日期 | 2026-05-01 |
-| 文档状态 | 初稿 |
+| 文档版本 | V2.0 |
+| 编写日期 | 2026-05-02 |
+| 文档状态 | 更新（同步spec.md第六轮评审修复） |
 
 ## 1 引言
 
@@ -90,6 +90,7 @@
 | 102002 | LOCK_ORDER_NOT_FOUND | 404 | 锁库存单据不存在 |
 | 102003 | LOCK_ORDER_NOT_ACTIVE | 409 | 锁库存单据非活跃状态 |
 | 102004 | LOCK_IDEMPOTENT_CONFLICT | 200 | 锁库存幂等命中（视为成功） |
+| 102005 | LOCK_ORDER_ALREADY_ARCHIVED | 409 | 锁库存幂等键对应单据已归档，需使用新幂等键 |
 | 103001 | MERGE_IN_PROGRESS | 409 | 合并提交正在进行中 |
 | 103002 | MERGE_NO_PENDING | 200 | 无待合并明细 |
 | 103003 | MERGE_SQ_INSUFFICIENT | 500 | 合并提交sq不足（告警） |
@@ -118,7 +119,8 @@
 {
     "skuId": 10001,
     "lockQuantity": 10000,
-    "idempotentKey": "lock-20260501-10001-001"
+    "idempotentKey": "lock-20260501-10001-001",
+    "reserveRatio": null
 }
 ```
 
@@ -127,6 +129,7 @@
 | skuId | Long | 是 | 商品ID/SKU |
 | lockQuantity | Integer | 是 | 锁定数量，必须大于0 |
 | idempotentKey | String | 是 | 幂等键，全局唯一，最长128字符 |
+| reserveRatio | Double | 否 | 预留DB降级比例，默认取store.auto-lock.reserve-ratio配置(0.1)，传0表示锁定全部额度 |
 
 #### 响应参数
 
@@ -151,6 +154,7 @@
 | lockOrderId | String | 锁库存单据ID，后续扣减时关联使用 |
 | skuId | Long | 商品ID |
 | actualLockQuantity | Integer | 实际锁定量（可能因部分锁定而小于请求量） |
+| reservedQuantity | Integer | 预留DB降级额度 = (sq-lq) * reserveRatio |
 | bucketCount | Integer | Redis分桶数量 |
 | expireTime | String | 过期时间(ISO 8601) |
 
@@ -589,7 +593,8 @@
     "orderId": "ORDER-20260501-001",
     "skuId": 10001,
     "refundQuantity": 10,
-    "refundId": "REFUND-20260501-001"
+    "refundId": "REFUND-20260501-001",
+    "refundRequestId": "REFUND-REQ-20260501-001"
 }
 ```
 
@@ -598,7 +603,8 @@
 | orderId | String | 是 | 订单ID |
 | skuId | Long | 是 | 商品ID |
 | refundQuantity | Integer | 是 | 退款数量，支持部分退款，必须大于0且不超过原扣减数量 |
-| refundId | String | 是 | 退款单号，作为回补明细ID，天然幂等 |
+| refundId | String | 是 | 退款单号，作为回补明细ID |
+| refundRequestId | String | 否 | 退款请求标识，业务级幂等键。同一退款请求的唯一标识，防止支付系统回调重试导致重复退款。建议始终传入 |
 
 #### 响应参数
 
@@ -863,10 +869,10 @@
 
 | 脚本名称 | 功能 | KEYS | ARGV | 返回值 |
 |----------|------|------|------|--------|
-| deduct.lua | 原子扣减 | bucketKey, totalRemainingKey | quantity | 1=成功, 0=不足 |
+| deduct.lua | 原子扣减 | bucketKey, totalRemainingKey | quantity | 1=成功, 2=成功且分桶耗尽, 0=不足 |
 | init_buckets.lua | 原子初始化分桶 | bucketKeys[1..N], metaKey, totalRemainingKey | bucketValues[1..N], metaValue, totalRemainingValue | 桶数量 |
 | cleanup_buckets.lua | 原子清理分桶 | bucketKeys[1..N], metaKey, totalRemainingKey | 无 | 1 |
-| incr_refund.lua | 原子INCR回补 | bucketKey, totalRemainingKey | quantity | 1 |
+| incr_refund.lua | 原子条件INCR回补 | metaKey, bucketKey, totalRemainingKey | quantity | 1=回补成功, 0=meta已失效跳过 |
 
 ### 5.2 Redis Key操作接口
 
