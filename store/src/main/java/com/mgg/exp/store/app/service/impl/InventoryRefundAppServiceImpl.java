@@ -24,6 +24,8 @@ import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.util.Optional;
+
 @Slf4j
 @Service
 @RequiredArgsConstructor
@@ -63,6 +65,16 @@ public class InventoryRefundAppServiceImpl implements InventoryRefundAppService 
     @Override
     @Transactional
     public RefundResult refund(String detailId, Integer quantity, String refundRequestId) {
+        if (refundRequestId != null) {
+            Optional<RefundDetail> existing = refundDetailRepository.findByRefDetailAndRequestId(
+                    detailId, refundRequestId);
+            if (existing.isPresent()) {
+                log.info("refund idempotent hit, detailId: {}, refundRequestId: {}",
+                        detailId, refundRequestId);
+                return RefundResult.skipped("IDEMPOTENT_HIT");
+            }
+        }
+
         DeductionDetail detail = deductionDetailRepository.findById(detailId);
         if (detail == null) {
             throw new InventoryException(ErrorCodeEnum.STOCK_NOT_FOUND,
@@ -87,8 +99,7 @@ public class InventoryRefundAppServiceImpl implements InventoryRefundAppService 
                     detail.getDeductPath(),
                     detail.getOrderId().value(),
                     detailId,
-                    refundRequestId
-            );
+                    refundRequestId);
             refundDetailRepository.save(refundDetail);
         } catch (DuplicateKeyException e) {
             log.warn("refund idempotent hit, detailId: {}, refundRequestId: {}",
@@ -191,8 +202,7 @@ public class InventoryRefundAppServiceImpl implements InventoryRefundAppService 
                     detail.getDeductPath(),
                     detail.getOrderId().value(),
                     detail.getId(),
-                    null
-            );
+                    null);
             refundDetailRepository.save(refundDetail);
         } catch (DuplicateKeyException e) {
             log.warn("MERGED cancel refund idempotent hit, detailId: {}", detail.getId());

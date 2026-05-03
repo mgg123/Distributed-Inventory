@@ -92,7 +92,9 @@ public class LockOrderRepositoryImpl implements LockOrderRepository {
                 Quantity.of(po.getLockQuantity()),
                 po.getBucketInfo(),
                 po.getExpireTime(),
-                po.getIdempotentKey()
+                LockOrderStatus.valueOf(po.getStatus()),
+                po.getIdempotentKey(),
+                po.getMergeCompleted() != null && po.getMergeCompleted()
         );
     }
 }

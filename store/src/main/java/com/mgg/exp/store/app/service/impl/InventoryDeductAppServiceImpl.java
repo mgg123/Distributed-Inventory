@@ -118,7 +118,8 @@ public class InventoryDeductAppServiceImpl implements InventoryDeductAppService 
         detail.setQuantity(Quantity.of(quantity));
         detail.setDeductPath(deductPath);
         detail.setBucketIndex(bucketIndex);
-        detail.setStatus(DeductionStatus.MERGED);
+        detail.setStatus(deductPath == DeductPath.MERGE_BUCKETS
+                ? DeductionStatus.PENDING : DeductionStatus.MERGED);
         detail.setOrderId(new OrderId(orderId));
         detail.setLockOrderId(lockOrderId);
         deductionDetailRepository.save(detail);

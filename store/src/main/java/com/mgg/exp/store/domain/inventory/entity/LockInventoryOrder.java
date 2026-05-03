@@ -31,6 +31,20 @@ public class LockInventoryOrder {
         this.mergeCompleted = false;
     }
 
+    public LockInventoryOrder(LockOrderId id, SkuId skuId, Quantity lockQuantity,
+                              String bucketInfo, LocalDateTime expireTime,
+                              LockOrderStatus status, String idempotentKey,
+                              boolean mergeCompleted) {
+        this.id = id;
+        this.skuId = skuId;
+        this.lockQuantity = lockQuantity;
+        this.bucketInfo = bucketInfo;
+        this.expireTime = expireTime;
+        this.status = status;
+        this.idempotentKey = idempotentKey;
+        this.mergeCompleted = mergeCompleted;
+    }
+
     public void archive() {
         this.status = LockOrderStatus.ARCHIVED;
     }

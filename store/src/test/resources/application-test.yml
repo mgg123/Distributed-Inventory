@@ -1,0 +1,50 @@
+spring:
+  datasource:
+    url: jdbc:h2:mem:store;MODE=MySQL;DB_CLOSE_DELAY=-1;DATABASE_TO_UPPER=false
+    username: sa
+    password:
+    driver-class-name: org.h2.Driver
+  h2:
+    console:
+      enabled: true
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:schema-test.sql
+  data:
+    redis:
+      host: 127.0.0.1
+      port: 6380
+
+mybatis-plus:
+  mapper-locations: classpath:mapper/*.xml
+  configuration:
+    map-underscore-to-camel-case: true
+  global-config:
+    db-config:
+      id-type: assign_id
+
+store:
+  bucket:
+    count: 16
+    fallover-max-retries: 3
+  merge:
+    delay-ms: 1000
+    idle-qps-threshold: 100
+  auto-lock:
+    enabled: false
+    reserve-ratio: 0.1
+    min-lock-quantity: 100
+    max-active: 2
+    trigger-ratio: 0.3
+    check-interval-ms: 500
+    expire-seconds: 300
+  redis:
+    fail-threshold: 5
+  lock:
+    wait-time-seconds: 10
+    lease-time-seconds: 30
+
+logging:
+  level:
+    com.mgg.exp.store: INFO
