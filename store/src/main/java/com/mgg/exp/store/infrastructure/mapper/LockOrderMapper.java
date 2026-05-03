@@ -31,6 +31,11 @@ public interface LockOrderMapper extends BaseMapper<LockInventoryOrderPO> {
             "WHERE id = #{lockOrderId} AND merge_completed = 0")
     int updateMergeCompleted(@Param("lockOrderId") String lockOrderId);
 
+    @Select("SELECT id, sku_id, lock_quantity, bucket_info, expire_time, status, " +
+            "idempotent_key, merge_completed, create_time, update_time " +
+            "FROM lock_inventory_order WHERE sku_id = #{skuId} AND status = 'ACTIVE'")
+    List<LockInventoryOrderPO> selectActiveBySkuId(@Param("skuId") Long skuId);
+
     @Update("UPDATE lock_inventory_order SET status = 'ARCHIVED', update_time = NOW() " +
             "WHERE sku_id = #{skuId} AND status = 'ACTIVE'")
     int archiveAllBySkuId(@Param("skuId") Long skuId);

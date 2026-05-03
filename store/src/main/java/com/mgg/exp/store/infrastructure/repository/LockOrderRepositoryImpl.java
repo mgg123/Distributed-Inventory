@@ -79,6 +79,12 @@ public class LockOrderRepositoryImpl implements LockOrderRepository {
                         .eq(LockInventoryOrderPO::getStatus, "ACTIVE"));
     }
 
+    @Override
+    public List<LockInventoryOrder> findActiveBySkuId(Long skuId) {
+        return lockOrderMapper.selectActiveBySkuId(skuId).stream()
+                .map(this::toEntity).toList();
+    }
+
     private LockInventoryOrder toEntity(LockInventoryOrderPO po) {
         return new LockInventoryOrder(
                 new LockOrderId(po.getId()),

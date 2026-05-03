@@ -24,4 +24,6 @@ public interface LockOrderRepository {
     int archiveAllBySkuId(Long skuId);
 
     long countActiveBySkuId(Long skuId);
+
+    List<LockInventoryOrder> findActiveBySkuId(Long skuId);
 }

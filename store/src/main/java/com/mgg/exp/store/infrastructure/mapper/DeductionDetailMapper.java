@@ -35,4 +35,11 @@ public interface DeductionDetailMapper extends BaseMapper<DeductionDetailPO> {
     @Update("UPDATE deduction_detail SET status = 'REFUNDED', update_time = NOW() " +
             "WHERE id = #{id} AND status = 'OCCUPIED'")
     int refundOccupied(@Param("id") String id);
+
+    @Select("SELECT id, sku_id, quantity, deduct_path, bucket_index, status, " +
+            "order_id, lock_order_id, merge_batch_id, create_time, update_time " +
+            "FROM deduction_detail WHERE order_id = #{orderId} AND sku_id = #{skuId} " +
+            "LIMIT 1")
+    DeductionDetailPO selectByOrderIdAndSkuId(@Param("orderId") String orderId,
+                                               @Param("skuId") Long skuId);
 }

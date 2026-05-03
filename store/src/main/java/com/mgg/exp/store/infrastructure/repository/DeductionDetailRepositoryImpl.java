@@ -84,6 +84,12 @@ public class DeductionDetailRepositoryImpl implements DeductionDetailRepository 
         return po != null ? toEntity(po) : null;
     }
 
+    @Override
+    public DeductionDetail findByOrderIdAndSkuId(String orderId, Long skuId) {
+        DeductionDetailPO po = deductionDetailMapper.selectByOrderIdAndSkuId(orderId, skuId);
+        return po != null ? toEntity(po) : null;
+    }
+
     private DeductionDetail toEntity(DeductionDetailPO po) {
         DeductionDetail detail = new DeductionDetail();
         detail.setId(po.getId());

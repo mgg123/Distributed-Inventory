@@ -23,4 +23,6 @@ public interface DeductionDetailRepository {
     List<DeductionDetail> findByLockOrderIdAndStatus(String lockOrderId, String status);
 
     DeductionDetail findById(String id);
+
+    DeductionDetail findByOrderIdAndSkuId(String orderId, Long skuId);
 }
