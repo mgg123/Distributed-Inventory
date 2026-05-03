@@ -3,7 +3,9 @@ package com.mgg.exp.store.domain.routing.service;
 import com.mgg.exp.store.domain.gateway.ActiveLockRouterGateway;
 import com.mgg.exp.store.domain.routing.valueobject.ActiveLockRoute;
 import com.mgg.exp.store.domain.routing.valueobject.RouteResolveResult;
+import org.springframework.stereotype.Service;
 
+@Service
 public class RoutingDomainService {
 
     private final ActiveLockRouterGateway routerGateway;

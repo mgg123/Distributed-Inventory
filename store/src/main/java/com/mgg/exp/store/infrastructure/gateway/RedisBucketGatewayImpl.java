@@ -40,7 +40,7 @@ public class RedisBucketGatewayImpl implements RedisBucketGateway {
 
     @Override
     public boolean initBuckets(String lockOrderId, Long skuId, int bucketCount,
-                                int quantityPerBucket) {
+            int quantityPerBucket) {
         try {
             List<Object> keys = new ArrayList<>();
             for (int i = 0; i < bucketCount; i++) {
@@ -54,7 +54,7 @@ public class RedisBucketGatewayImpl implements RedisBucketGateway {
 
             RScript rScript = redissonClient.getScript();
             rScript.eval(RScript.Mode.READ_WRITE, script,
-                    RScript.ReturnType.INTEGER, keys, quantityPerBucket, metaValue);
+                    RScript.ReturnType.LONG, keys, quantityPerBucket, metaValue);
             return true;
         } catch (Exception e) {
             log.error("initBuckets failed, lockOrderId: {}", lockOrderId, e);
@@ -69,10 +69,9 @@ public class RedisBucketGatewayImpl implements RedisBucketGateway {
             RScript rScript = redissonClient.getScript();
             List<Object> keys = List.of(
                     bucketKey(lockOrderId, bucketIndex),
-                    totalRemainingKey(lockOrderId)
-            );
+                    totalRemainingKey(lockOrderId));
             return rScript.eval(RScript.Mode.READ_WRITE, script,
-                    RScript.ReturnType.INTEGER, keys, quantity);
+                    RScript.ReturnType.LONG, keys, quantity);
         } catch (Exception e) {
             log.error("deduct failed, lockOrderId: {}, bucketIndex: {}", lockOrderId, bucketIndex, e);
             return -1;
@@ -92,10 +91,9 @@ public class RedisBucketGatewayImpl implements RedisBucketGateway {
             List<Object> keys = List.of(
                     metaKey(lockOrderId),
                     bucketKey(lockOrderId, bucketIndex),
-                    totalRemainingKey(lockOrderId)
-            );
+                    totalRemainingKey(lockOrderId));
             return rScript.eval(RScript.Mode.READ_WRITE, script,
-                    RScript.ReturnType.INTEGER, keys, quantity);
+                    RScript.ReturnType.LONG, keys, quantity);
         } catch (Exception e) {
             log.error("incrRefund failed, lockOrderId: {}, bucketIndex: {}",
                     lockOrderId, bucketIndex, e);
@@ -116,7 +114,7 @@ public class RedisBucketGatewayImpl implements RedisBucketGateway {
             String script = loadScript("lua/cleanup_buckets.lua");
             RScript rScript = redissonClient.getScript();
             rScript.eval(RScript.Mode.READ_WRITE, script,
-                    RScript.ReturnType.INTEGER, keys);
+                    RScript.ReturnType.LONG, keys);
         } catch (Exception e) {
             log.error("cleanupBuckets failed, lockOrderId: {}", lockOrderId, e);
         }
